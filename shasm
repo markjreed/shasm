@@ -15,7 +15,7 @@ usage() {
     exit $rc
 }
 
-declare -A ORGS=([pet]=0x1001 [vic20]=0x1001 [c64]=0x0801 [c16]=0x1001
+declare -A ORGS=([pet]=0x0401 [vic20]=0x1001 [c64]=0x0801 [c16]=0x1001
                  [plus4]=0x1001 [c128]=0x1c01 [cx16]=0x0801)
 HEADER_BYTES=12
 declare -A INSTRUCTIONS=(
