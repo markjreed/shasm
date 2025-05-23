@@ -535,8 +535,10 @@ pass() {
 
 eval_expression() {
     local exp key value
-    exp=$(sed -e 's/\$/0x/g' -e 's/< *\([a-z0-9_]*\)/(\1\&0xff)/g' \
-              -e 's/> *\([a-z0-9_]*\)/(\1>>8)/g' <<< "$*")
+
+    # translate < and > 
+    exp=$(sed -e 's/\$/0x/g' -e 's/</0xff\&/g' \
+              -e 's/> *(\([^)]*\))/(\1)>>8/g' <<< "$*")
     for key in "${!SYMBOLS[@]}"; do
         exp=$(sed -e "s/[[:<:]]$key[[:>:]]/${SYMBOLS[$key]}/g" <<< "$exp");
     done;
