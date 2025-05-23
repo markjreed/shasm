@@ -1,0 +1,558 @@
+#!/usr/bin/env bash
+# 65(C)02 assembler written entirely in bash. Why? Masochism?
+# Note: Does not support Rockwell RMBn/SMBn instructions
+
+if (( BASH_VERSINFO[0] < 4 )); then
+    echo >&2 "This program requires bash version >= 4."
+    exit 255
+fi
+
+usage() {
+    local rc=${1:-1}
+    local fd
+    (( fd = rc ? 2 : 1 ))
+    printf >&$fd 'Usage: %s [-t target] [-c cputype] [-o outputfile] [-l listfile] source [...]\n' "$0"
+    exit $rc
+}
+
+declare -A ORGS=([pet]=0x1001 [vic20]=0x1001 [c64]=0x0801 [c16]=0x1001
+                 [plus4]=0x1001 [c128]=0x1c01 [cx16]=0x0801)
+HEADER_BYTES=12
+declare -A INSTRUCTIONS=(
+    [nmos]="ADC AND ASL BCC BCS BEQ BIT BMI BNE BPL BRK BVC BVS CLC CLD CLI CLV
+            CMP CPX CPY DEC DEX DEY EOR INC INX INY JMP JSR LDA LDX LDY LSR NOP
+            ORA PHA PHP PLA PLP ROL ROR RTI RTS SBC SEC SED SEI STA STX STY TAX
+            TAY TSX TXA TXS TYA"
+    [cmos]="BRA PHX PHY PLX PLY STZ TRB TSB"
+)
+MNEMONICS="${INSTRUCTIONS[nmos]}"
+declare -A SYMBOLS
+
+main() {
+    local target=c64 cputype=nmos output=a.out labels=
+    local opt 
+    while getopts c:o:l:t:-: opt; do
+        case "$opt" in
+          c) cputype=$OPTARG;;
+          l) labels=$OPTARG;;
+          o) output=$OPTARG;;
+          t) target=$OPTARG;;
+          *) usage 1;;
+        esac
+    done
+    shift $(( OPTIND - 1 ))
+    if (( ! $# )); then
+        usage 1
+    fi
+    cputype=$(setup_target "$target")
+    setup_cpu "$cputype" 
+    local combined=$(mktemp)
+    trap "rm -f '$combined'" EXIT
+    cat "$@" | preprocess >"$combined"
+    exec 3>&2
+    assemble "$target" "$combined" >"$output"
+    if [[ -n $labels ]]; then
+        dump_symbols >"$labels"
+    fi
+}
+
+# 6502 Addressing modes:
+declare -a MODE_NAMES=(ABS ABS_X ABS_Y ACC IMM IMP IND INDX REL ZP ZP_X ZP_Y ZPI ZPIX ZPIY)
+
+(( _BITVAL = 1 ))
+(( ABS   = _BITVAL, _BITVAL <<= 1 )) # ABS     = Absolute    - operand is 16-bit expr
+(( ABS_X = _BITVAL, _BITVAL <<= 1 )) # ABS,X   = Absolute,X  - operand is 16-bit expr
+(( ABS_Y = _BITVAL, _BITVAL <<= 1 )) # ABS,Y   = Absolute,Y  - operand is 16-bit expr 
+(( ACC   = _BITVAL, _BITVAL <<= 1 )) # ACC     = Accumulator - operand is "A"
+(( IMM   = _BITVAL, _BITVAL <<= 1 )) # IMM     = Immediate   - operand after "#" is 8-bit expr
+(( IMP   = _BITVAL, _BITVAL <<= 1 )) # IMP     = Implicit    - no operand
+(( IND   = _BITVAL, _BITVAL <<= 1 )) # (ABS)   = Indirect    - operand is 16-bit expr
+(( INDX  = _BITVAL, _BITVAL <<= 1 )) # (ABS,X) = Ix.Ir.Abs   - 65C02 JMP instruction only
+(( REL   = _BITVAL, _BITVAL <<= 1 )) # REL     = Relative    - operand is 8-bit offset
+(( ZP    = _BITVAL, _BITVAL <<= 1 )) # ZP      = Zero Page   - operand is 8-bit expr
+(( ZP_X  = _BITVAL, _BITVAL <<= 1 )) # ZP,X    = Zero Page,X - operand is 8-bit expr
+(( ZP_Y  = _BITVAL, _BITVAL <<= 1 )) # ZP,Y    = Zero Page,Y - operand is 8-bit expr
+(( ZPI   = _BITVAL, _BITVAL <<= 1 )) # (ZP)    = ZP Indirect - operand is 16-bit expr (65C02)
+(( ZPIX  = _BITVAL, _BITVAL <<= 1 )) # (ZP,X)  = Indexed Ir  - operand is 8-bit expr
+(( ZPIY  = _BITVAL, _BITVAL <<= 1 )) # (ZP),Y  = Indirect Ix - operand is 8-bit expr
+
+declare -A ADDR_MODES=(
+    [ADC]=$(( ABS | ABS_X | ABS_Y | IMM | ZP | ZP_X | ZPIX | ZPIY ))
+    [AND]=$(( ABS | ABS_X | ABS_Y | IMM | ZP | ZP_X | ZPIX | ZPIY ))
+    [ASL]=$(( ABS | ABS_X | ACC   | IMP | ZP | ZP_X ))
+    [BCC]=$(( REL ))
+    [BCS]=$(( REL ))
+    [BEQ]=$(( REL ))
+    [BIT]=$(( ABS | ZP ))
+    [BMI]=$(( REL )) 
+    [BNE]=$(( REL ))
+    [BPL]=$(( REL ))
+    [BRA]=$(( REL )) # 65C02 only
+    [BRK]=$(( IMP ))
+    [BVC]=$(( REL ))
+    [BVS]=$(( REL ))
+    [CLC]=$(( IMP ))
+    [CLD]=$(( IMP ))
+    [CLI]=$(( IMP ))
+    [CLV]=$(( IMP ))
+    [CMP]=$(( ABS | ABS_X | ABS_Y | IMM | ZP | ZP_X | ZPIX | ZPIY ))
+    [CPX]=$(( ABS | IMM | ZP ))
+    [CPY]=$(( ABS | IMM | ZP ))
+    [DEC]=$(( ABS | ABS_X | ZP | ZP_X ))
+    [DEX]=$(( IMP ))
+    [DEY]=$(( IMP ))
+    [EOR]=$(( ABS | ABS_X | ABS_Y | IMM | ZP | ZP_X | ZPIX | ZPIY ))
+    [INC]=$(( ABS | ABS_X | ZP | ZP_X ))
+    [INX]=$(( IMP ))
+    [INY]=$(( IMP ))
+    [JMP]=$(( ABS | IND ))
+    [JSR]=$(( ABS ))
+    [LDA]=$(( ABS | ABS_X | ABS_Y | IMM | ZP | ZP_X | ZPIX | ZPIY ))
+    [LDX]=$(( ABS | ABS_Y | IMM | ZP | ZP_Y ))
+    [LDY]=$(( ABS | ABS_X | IMM | ZP | ZP_X ))
+    [LSR]=$(( ABS | ABS_X | ACC | ZP | ZP_X ))
+    [NOP]=$(( IMP ))
+    [PHA]=$(( IMP ))
+    [PHP]=$(( IMP ))
+    [PHX]=$(( IMP )) # 65C02 only
+    [PHY]=$(( IMP )) # 65C02 only
+    [PLA]=$(( IMP ))
+    [PLP]=$(( IMP ))
+    [PLX]=$(( IMP )) # 65C02 only
+    [PLY]=$(( IMP )) # 65C02 only
+    [ROL]=$(( ABS | ABS_X | ACC | ZP | ZP_X ))
+    [ROR]=$(( ABS | ABS_X | ACC | ZP | ZP_X ))
+    [RTI]=$(( IMP ))
+    [RTS]=$(( IMP ))
+    [SBC]=$(( ABS | ABS_X | ABS_Y | IMM | ZP | ZP_X | ZPIX | ZPIY ))
+    [SEC]=$(( IMP ))
+    [SED]=$(( IMP ))
+    [SEI]=$(( IMP ))
+    [STA]=$(( ABS | ABS_X | ABS_Y | ZP | ZP_X | ZPIX | ZPIY ))
+    [STX]=$(( ABS | ZP | ZP_Y ))
+    [STY]=$(( ABS | ZP | ZP_X ))
+    [STZ]=$(( ABS | ABS_X | ZP | ZP_X )) # 65C02 only
+    [TAX]=$(( IMP ))
+    [TAY]=$(( IMP ))
+    [TRB]=$(( ABS | ZP )) # 65C02 only
+    [TSB]=$(( ABS | ZP )) # 65C02 only
+    [TSX]=$(( IMP ))
+    [TXA]=$(( IMP ))
+    [TXS]=$(( IMP ))
+    [TYA]=$(( IMP ))
+)
+
+declare -A OPCODES=(
+          #ABS,ABS_X,ABS_Y,ACC,IMM,IMP,IND,INDX,REL,ZP,ZP_X,ZP_Y,ZPI,ZPIX,ZPIY 
+    [ADC]="0x6D,0x7D,0x79,-,0x69,-,-,-,-,0x65,0x75,-,0x72,0x61,0x71"
+    [AND]="0x2D,0x3D,0x39,-,0x29,-,-,-,-,0x25,0x35,-,0x32,0x21,0x31"
+    [ASL]="0x0E,0x1E,-,0x0A,-,0x0A,-,-,-,0x06,0x16,-,-,-,-"
+    [BCC]="-,-,-,-,-,-,-,-,0x90,-,-,-,-,-,-"
+    [BCS]="-,-,-,-,-,-,-,-,0xB0,-,-,-,-,-,-"
+    [BEQ]="-,-,-,-,-,-,-,-,0xF0,-,-,-,-,-,-"
+    [BIT]="0x2C,0x3C,-,-,0x89,-,-,-,-,0x24,0x34,-,-,-,-"
+    [BMI]="-,-,-,-,-,-,-,-,0x30,-,-,-,-,-,-"
+    [BNE]="-,-,-,-,-,-,-,-,0xD0,-,-,-,-,-,-"
+    [BPL]="-,-,-,-,-,-,-,-,0x10,-,-,-,-,-,-"
+    [BRA]="-,-,-,-,-,-,-,-,0x80,-,-,-,-,-,-"
+    [BRK]="-,-,-,-,-,0x00,-,-,-,-,-,-,-,-,-"
+    [BVC]="-,-,-,-,-,-,-,-,0x50,-,-,-,-,-,-"
+    [BVS]="-,-,-,-,-,-,-,-,0x70,-,-,-,-,-,-"
+    [CLC]="-,-,-,-,-,0x18,-,-,-,-,-,-,-,-,-"
+    [CLD]="-,-,-,-,-,0xD8,-,-,-,-,-,-,-,-,-"
+    [CLI]="-,-,-,-,-,0x58,-,-,-,-,-,-,-,-,-"
+    [CLV]="-,-,-,-,-,0xB8,-,-,-,-,-,-,-,-,-"
+    [CMP]="0xCD,0xDD,0xD9,-,0xC9,-,-,-,-,0xC5,0xD5,-,0xD2,0xC1,0xD1"
+    [CPX]="0xEC,-,-,-,0xE0,-,-,-,-,0xE4,-,-,-,-,-"
+    [CPY]="0xCC,-,-,-,0xC0,-,-,-,-,0xC4,-,-,-,-,-"
+    [DEC]="0xCE,0xDE,-,0x3A,-,0x3A,-,-,-,0xC6,0xD6,-,-,-,-"
+    [DEX]="-,-,-,-,-,0xCA,-,-,-,-,-,-,-,-,-"
+    [DEY]="-,-,-,-,-,0x88,-,-,-,-,-,-,-,-,-"
+    [EOR]="0x4D,0x5D,0x59,-,0x49,-,-,-,-,0x45,0x55,-,0x52,0x41,0x51"
+    [INC]="0xEE,0xFE,-,0x1A,-,0x1A,-,-,-,0xE6,0xF6,-,-,-,-"
+    [INX]="-,-,-,-,-,0xE8,-,-,-,-,-,-,-,-,-"
+    [INY]="-,-,-,-,-,0xC8,-,-,-,-,-,-,-,-,-"
+    [JMP]="0x4C,0x7C,-,-,-,-,0x6C,-,-,-,-,-,-,-,-"
+    [JSR]="0x20,-,-,-,-,-,-,-,-,-,-,-,-,-,-"
+    [LDA]="0xAD,0xBD,0xB9,-,0xA9,-,-,-,-,0xA5,0xB5,-,0xB2,0xA1,0xB1"
+    [LDX]="0xAE,-,0xBE,-,0xA2,-,-,-,-,0xA6,-,0xB6,-,-,-"
+    [LDY]="0xAC,0xBC,-,-,0xA0,-,-,-,-,0xA4,0xB4,-,-,-,-"
+    [LSR]="0x4E,0x5E,-,0x4A,-,0x4A,-,-,-,0x46,0x56,-,-,-,-"
+    [NOP]="-,-,-,-,-,0xEA,-,-,-,-,-,-,-,-,-"
+    [ORA]="0x0D,0x1D,0x19,-,0x09,-,-,-,-,0x05,0x15,-,0x12,0x01,0x11"
+    [PHA]="-,-,-,0x48,-,0x48,-,-,-,-,-,-,-,-,-"
+    [PHP]="-,-,-,-,-,0x08,-,-,-,-,-,-,-,-,-"
+    [PHX]="-,-,-,-,-,0xDA,-,-,-,-,-,-,-,-,-"
+    [PHY]="-,-,-,-,-,0x5A,-,-,-,-,-,-,-,-,-"
+    [PLA]="-,-,-,0x68,-,0x68,-,-,-,-,-,-,-,-,-"
+    [PLP]="-,-,-,-,-,0x28,-,-,-,-,-,-,-,-,-"
+    [PLX]="-,-,-,-,-,0xFA,-,-,-,-,-,-,-,-,-"
+    [PLY]="-,-,-,-,-,0x7A,-,-,-,-,-,-,-,-,-"
+    [ROL]="0x2E,0x3E,-,0x2A,-,0x2A,-,-,-,0x26,0x36,-,-,-,-"
+    [ROR]="0x6E,0x7E,-,0x6A,-,0x6A,-,-,-,0x66,0x76,-,-,-,-"
+    [RTI]="-,-,-,-,-,0x40,-,-,-,-,-,-,-,-,-"
+    [RTS]="-,-,-,-,-,0x60,-,-,-,-,-,-,-,-,-"
+    [SBC]="0xED,0xFD,0xF9,-,0xE9,-,-,-,-,0xE5,0xF5,-,0xF2,0xE1,0xF1"
+    [SEC]="-,-,-,-,-,0x38,-,-,-,-,-,-,-,-,-"
+    [SED]="-,-,-,-,-,0xF8,-,-,-,-,-,-,-,-,-"
+    [SEI]="-,-,-,-,-,0x78,-,-,-,-,-,-,-,-,-"
+    [STA]="0x8D,0x9D,0x99,-,-,-,-,-,-,0x85,0x95,-,0x92,0x81,0x91"
+    [STP]="-,-,-,-,-,0xDB,-,-,-,-,-,-,-,-,-"
+    [STX]="0x8E,-,-,-,-,-,-,-,-,0x86,-,0x96,-,-,-"
+    [STY]="0x8C,-,-,-,-,-,-,-,-,0x84,0x94,-,-,-,-"
+    [STZ]="0x9C,0x9E,-,-,-,-,-,-,-,0x64,0x74,-,-,-,-"
+    [TAX]="-,-,-,-,-,0xAA,-,-,-,-,-,-,-,-,-"
+    [TAY]="-,-,-,-,-,0xA8,-,-,-,-,-,-,-,-,-"
+    [TRB]="0x1C,-,-,-,-,-,-,-,-,0x14,-,-,-,-,-"
+    [TSB]="0x0C,-,-,-,-,-,-,-,-,0x04,-,-,-,-,-"
+    [TSX]="-,-,-,-,-,0xBA,-,-,-,-,-,-,-,-,-"
+    [TXA]="-,-,-,-,-,0x8A,-,-,-,-,-,-,-,-,-"
+    [TXS]="-,-,-,-,-,0x9A,-,-,-,-,-,-,-,-,-"
+    [TYA]="-,-,-,-,-,0x98,-,-,-,-,-,-,-,-,-"
+    [WAI]="-,-,-,-,-,0xCB,-,-,-,-,-,-,-,-,-"
+)
+
+setup_target() {
+    case "$1" in
+        cbm|pet|vic20|c64|c16|plus4|ted|c128) printf '%s\n' nmos;;
+        cx16) printf '%s\n' cmos;;
+        *) die 'Unknown target "%s"\n' "$1";;
+    esac
+}
+
+setup_cpu() {
+    case "$1" in
+        6502|6510|8502|nmos);;
+        cmos|65[Cc]02)
+        (( 
+            ADDR_MODES[ADC] |= ZPI,
+            ADDR_MODES[AND] |= ZPI,
+            ADDR_MODES[BIT] |= ABS_X | IMM | ZP_X,
+            ADDR_MODES[CMP] |= ZPI,
+            ADDR_MODES[DEC] |= ACC | IMP,
+            ADDR_MODES[EOR] |= ZPI,
+            ADDR_MODES[INC] |= ACC | IMP,
+            ADDR_MODES[JMP] |= INDX,
+            ADDR_MODES[LDA] |= ZPI,
+            ADDR_MODES[ORA] |= ZPI,
+            ADDR_MODES[SBC] |= ZPI,
+            ADDR_MODES[STA] |= ZPI
+        ))
+        MNEMONICS+=" ${INSTRUCTIONS[cmos]}"
+        ;;
+        *) die "unknown CPU type '%s'" "$1";;
+    esac
+}
+
+warn() {
+    printf >&2 '%s: %s' "$0" "$(printf "$@")"
+}
+
+die() {
+    warn "$@"
+    exit 1
+}
+
+preprocess() {
+    # strip comments, replace strings with lists of numbers
+    sed -e 's/\\"/",34,"/g' -e 's/\\\\/",92,"/g' |
+    expand_strings | sed -ne 's/;.*//g' -e $'/[^ \t]/p'
+}
+
+LOG_ADDR=0
+BYTES=()
+new_log_line() {
+    if (( ${#BYTES[@]} )); then
+        log_line
+        echo >&3
+    fi
+    LOG_ADDR=$(( $1 ))
+}
+
+log_line() {
+    local val str
+    str=$(printf '%04X' "$LOG_ADDR")
+    for val in "${BYTES[@]}"; do
+        if (( $val )) >/dev/null || [[ $val = 0* ]]; then
+            str+=$(printf ' %02X' "$val")
+        else
+            str+=' xx'
+        fi
+    done
+    printf '%-16s' "$str" >&3
+    (( LOG_ADDR += ${#BYTES[@]} ))
+    BYTES=()
+    return ${#str}
+}
+    
+gen_bytes() {
+    local val
+    for val; do
+        BYTES+=($val)
+        if (( ${#BYTES[@]} == 8 )); then
+            log_line
+            echo >&3
+        fi
+        if (( $val )) >/dev/null || [[ $val = 0* ]]; then
+            printf "\x$(printf '%x' "$val")"
+        fi
+    done
+}
+
+gen_words() {
+    local val
+    for val; do
+        gen_bytes "$(( val & 0xff ))" "$(( val >> 8 ))"
+    done
+}
+
+gen_string() {
+    local val="$*" i
+    for (( i=0; i<${#val}; ++i )); do
+        gen_bytes "$(printf %d "'${val:$i:1}")"  
+    done
+}
+
+gen_header() {
+    local target=$1
+    local org=${ORGS[$target]} lptr sys addr
+    new_log_line $(( org - 2 ))
+    (( lptr = org + 10, addr = lptr + 2 ))
+    gen_words $org $lptr $(date +%Y)
+    gen_bytes 0x9e 
+    gen_string $addr
+    gen_bytes 0 0 0
+}
+
+expand_strings() {
+    local line i ch q=0 first
+    while IFS= read -r line; do
+        first=1
+        for (( i=0; i<${#line}; ++i )); do
+            ch=${line:$i:1}
+            if [[ $ch = '"' ]]; then
+                (( q=1-q ))
+            elif (( q )); then
+                if (( first )); then
+                    first=0
+                else
+                    printf ','
+                fi
+                printf '%d' "'$ch"
+            else
+                printf '%s' "$ch"
+            fi
+        done
+        echo
+    done
+}
+
+assemble() {
+    pass 1 "$@"
+    gen_header "$1"
+    pass 2 "$@"
+}
+
+pass() {
+    local pass=$1 target=$2 input=$3 line label mnemonic argument
+    local org=$(( ${ORGS[$target]} + HEADER_BYTES )) modes op val old
+    local mnemonics=(${INSTRUCTIONS[nmos]})
+    local -i num=0
+
+    while IFS= read -r line; do
+        old=$org
+        (( num++ ))
+        if (( pass == 2 )); then 
+            new_log_line "$org"
+        fi
+        case "$line" in 
+            ' '*|$'\t'*) label=; read mnemonic argument <<<"$line";;
+            *) read label mnemonic argument <<<"$line"; label=${label%:};;
+        esac
+        if [[ -n $label && $mnemonic = EQU ]]; then
+            argument=${argument//\*/$org}
+            if ! val=$(eval_expression "$argument"); then
+                if (( pass == 1 )); then
+                    SYMBOLS[$label]=$argument
+                else
+                    die "Unresolved expression in line %d" "$num"
+                fi
+            else
+                if (( pass == 1 )); then 
+                    SYMBOLS[$label]=$val
+                elif (( SYMBOLS[$label] != val )); then
+                    die 'line %d: Symbol mismatch between passes: %s\n' "$num" "$label"
+                fi
+            fi
+            if (( pass == 2 )); then
+                printf >&3 '%-16s' "$(printf '%04X' "$old")" "$label" \
+                    "$mnemonic" "$argument" \
+                    "$(printf '%s=$%04X' "$label" "${SYMBOLS[$label]}")"
+                echo >&3
+            fi
+            continue
+        elif [[ -n $label ]]; then
+            if (( pass == 1 )); then 
+                SYMBOLS[$label]=$org
+            elif (( SYMBOLS[$label] != org )); then
+                die 'line %d: Symbol mismatch between passes: %s\n' "$num" "$label"
+            fi
+        fi
+        case "$mnemonic" in
+            ORG) 
+                if ! org=$(eval_expression "$argument"); then
+                    die "Unresolved expression '$argument' in line $num"
+                fi
+                if (( pass == 2 )); then
+                    local sym=$(printf '*=$%04X' "$org")
+                    if [[ -n $label ]]; then
+                        sym=$(printf '%s=$%04X,%s' "$label" "${SYMBOLS[$label]}" "$sym")
+                    fi
+                    printf >&3 '%-16s' "$(printf '%04X' "$old")" "$label" \
+                    "$mnemonic" "$argument" "$sym"
+                    echo >&3
+                fi
+                continue
+                ;;
+            DB) 
+                (( org += $(grep -o , <<<"$argument" | wc -l) + 1 ))
+                if (( pass == 2 )); then
+                    gen_bytes $(tr ',' ' ' <<<"$argument")
+                    log_line
+                    if (( $? > 16 )); then
+                        echo >&3
+                        printf '%-16s' "$(printf '%04X' "$old")" >&3
+                    fi 
+                    local sym=
+                    if [[ -n $label ]]; then
+                        sym=$(printf '%s=$%04X' "$label" "${SYMBOLS[$label]}")
+                    fi
+                    printf >&3 '%-16s' "$label" "$mnemonic" "${argument:0:15}" "$sym"
+                    echo >&3
+                fi
+                continue
+                ;;
+            DW) 
+                (( org += 2*($(grep -o , <<<"$argument" | wc -l) + 1) ))
+                if (( pass == 2 )); then
+                    gen_words $(tr ',' ' ' <<<"$argument")
+                    log_line
+                    local sym=
+                    if [[ -n $label ]]; then
+                        sym=$(printf '%s=$%04X' "$label" "${SYMBOLS[$label]}")
+                    fi
+                    printf >&3 '%-16s' "$label" "$mnemonic" "${argument:0:15}" "$sym"
+                    echo >&3
+                fi
+                continue
+                ;;
+        esac
+
+        case "$MNEMONICS" in
+            $mnemonic\ *|*\ $mnemonic\ *|*\ $mnemonic) :;;
+            *) die "Unrecognized instruction $mnemonic in line $num";;
+        esac
+
+        case "$argument" in
+            '')        modes=$((IMP)); op=$argument;;
+            A)         modes=$((ACC));;
+            '#'*)      modes=$((IMM)); op=${argument#\#};;
+            '('*',X)') modes=$((ZPIX|INDX));  op=${argument#\(}; op=${op%,X\)};;
+            '('*'),Y') modes=$((ZPIY));    op=${argument#\(}; op=${op%\),Y};;
+            *,X)       modes=$((ZP_X|ABS_X)); op=${argument%,X};;
+            *,Y)       modes=$((ZP_Y|ABS_Y)); op=${argument%,Y};;
+            '('*')')   modes=$((ZPI|IND));   op=${argument#\(}; op=${op%\)};;
+            *)         modes=$((ABS|ZP|REL)); op=$argument;;
+        esac
+        (( modes &= ADDR_MODES[$mnemonic] ))
+        if (( ! modes )); then
+            die "Invalid addressing mode on line $num"
+        fi
+        if (( pass == 1)); then
+            if (( modes == ACC || modes == IMP )); then
+                (( org += 1 ))
+                continue
+            elif (( modes == IMM  || modes == REL  || modes == ZP || modes == ZP_X ||
+                    modes == ZP_Y || modes == ZPIX || modes == ZPIY )); then
+                (( org += 2 ))
+                continue
+            elif (( modes == ZP_X|ABS_X || modes == ZP_Y|ABS_Y | modes == ZPIX|INDX ||
+                    modes == ZPI|IND || modes == ABS|ZP )) && val=$(eval_expression "$op") &&
+                    (( val < 256 )); then
+                (( org += 2  ))
+            else
+                (( org += 3 ))
+            fi
+        else 
+            local modebits=() opcodes
+            if ! val=$(eval_expression "$op"); then
+                die "Unresolved expression in line %d" "$num"
+            fi
+
+            for (( i=0; modes; ++i )); do
+                if (( modes & 1 )); then modebits+=($i); fi
+                (( modes >>= 1 ))
+            done
+            if (( ${#modebits[@]} > 1 )); then
+                if (( val < 256 )); then
+                    modebits=(${modebits[-1]})
+                else
+                    modebits=(${modebits[0]})
+                fi
+            fi
+            opcodes=(${OPCODES[$mnemonic]//,/\ })
+            #echo "OPCODES[$mnemonic]='${OPCODES[mnemonic]}'">&3
+            #echo "for $mnemonic, opcodes=(${opcodes[*]})" >&3
+            gen_bytes "${opcodes[$modebits]:-xx}"
+
+            (( modes = 1 << ${modebits[0]} ))
+            (( org += 1 ))
+            if (( modes == REL )); then
+                (( delta = val - (org + 1) ))
+                if (( delta < -128 || delta > 127 )); then
+                    die "Branch out of range in line %d" "$num"
+                fi
+                gen_bytes $(( delta < 0 ? delta + 256 : delta ))
+                (( org += 1 ))
+            elif (( modes == IMM  || modes == ZP || modes == ZP_X ||
+                    modes == ZP_Y || modes == ZPIX || modes == ZPIY )); then
+                gen_bytes "$val"
+                (( org += 1 ))
+            elif (( modes != ACC && modes != IMP )); then
+                gen_words "$val"
+                (( org += 2  ))
+            fi
+            log_line
+            local sym=
+            if [[ -n $label ]]; then
+                sym=$(printf '%s=$%04X' "$label" "${SYMBOLS[$label]}")
+            fi
+            printf >&3 '%-16s' "$label" "$mnemonic" "$argument" "$sym"
+            echo >&3
+        fi
+     done <"$input"
+}
+
+eval_expression() {
+    local exp key value
+    exp=$(sed -e 's/\$/0x/g' -e 's/<\([a-z0-9_]*\)/(\1\&0xff)/g' -e 's/>\([a-z0-9_]*\)/(\1>>8)/g' <<< "$*")
+    for key in "${!SYMBOLS[@]}"; do
+        exp=$(sed -e "s/[[:<:]]$key[[:>:]]/${SYMBOLS[$key]}/g" <<< "$exp");
+    done;
+    if grep -q '[[:<:]][a-zA-Z_]' <<<"$exp"; then
+        echo 0
+        return 1
+    else
+        printf '%s\n' $(( $exp ))
+        return 0
+    fi
+}
+
+dump_symbols() {
+    local key
+    for key in "${!SYMBOLS[@]}"; do
+        printf 'al %06X .%s\n' "${SYMBOLS[$key]}" "$key"
+    done
+}
+
+main "$@"
