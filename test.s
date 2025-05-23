@@ -6,7 +6,7 @@ CHROUT          EQU             $FFD2
 
 main            LDA             #<msg
                 STA             ptr
-                LDA             #>msg
+                LDA             #>(msg)
                 STA             ptr+1
                 LDY             #$00
 loop            LDA             (ptr),Y
@@ -16,4 +16,4 @@ loop            LDA             (ptr),Y
                 BNE             loop
 done            RTS
 
-msg             DB              "HELLO, WORLD!",13,0
+msg             DB              5,"HELLO, WORLD!",13,0
