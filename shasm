@@ -18,8 +18,8 @@ usage() {
 
 declare -A ORGS=([pet]=0x0401 [vic20]=0x1001 [vic20+3k]=0x0401
                  [vic20+8k]=0x1201 [vic20+16k]=0x1201 [vic20+24k]=0x1201
-                 [c64]=0x0801 [c16]=0x1001 [plus4]=0x1001 [c128]=0x1c01
-                 [c128+]=[cx16]=0x0801)
+                 [c64]=0x0801 [c16]=0x1001 [plus4]=0x1001 [ted]=0x1001
+                 [c128]=0x1c01 [c128+gfx]=0x4000 [cx16]=0x0801)
 HEADER_BYTES=12
 declare -A INSTRUCTIONS=(
     [nmos]="ADC AND ASL BCC BCS BEQ BIT BMI BNE BPL BRK BVC BVS CLC CLD CLI CLV
@@ -218,7 +218,7 @@ declare -A OPCODES=(
 
 setup_target() {
     case "$1" in
-        cbm|pet|vic20*|c64|c16|plus4|ted|c128) printf '%s\n' nmos;;
+        cbm|pet|vic20*|c64|c16|plus4|ted|c128*) printf '%s\n' nmos;;
         cx16) printf '%s\n' cmos;;
         *) die 'Unknown target "%s"\n' "$1";;
     esac
