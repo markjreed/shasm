@@ -454,14 +454,14 @@ pass() {
         esac
 
         case "$argument" in
-            '')        modes=$((IMP)); op=$argument;;
+            '')        modes=$((IMP));;
             A)         modes=$((ACC));;
-            '#'*)      modes=$((IMM)); op=${argument#\#};;
+            '#'*)      modes=$((IMM));        op=${argument#\#};;
             '('*',X)') modes=$((ZPIX|INDX));  op=${argument#\(}; op=${op%,X\)};;
-            '('*'),Y') modes=$((ZPIY));    op=${argument#\(}; op=${op%\),Y};;
+            '('*'),Y') modes=$((ZPIY));       op=${argument#\(}; op=${op%\),Y};;
             *,X)       modes=$((ZP_X|ABS_X)); op=${argument%,X};;
             *,Y)       modes=$((ZP_Y|ABS_Y)); op=${argument%,Y};;
-            '('*')')   modes=$((ZPI|IND));   op=${argument#\(}; op=${op%\)};;
+            '('*')')   modes=$((ZPI|IND));    op=${argument#\(}; op=${op%\)};;
             *)         modes=$((ABS|ZP|REL)); op=$argument;;
         esac
         (( modes &= ADDR_MODES[$mnemonic] ))
@@ -535,7 +535,8 @@ pass() {
 
 eval_expression() {
     local exp key value
-    exp=$(sed -e 's/\$/0x/g' -e 's/<\([a-z0-9_]*\)/(\1\&0xff)/g' -e 's/>\([a-z0-9_]*\)/(\1>>8)/g' <<< "$*")
+    exp=$(sed -e 's/\$/0x/g' -e 's/< *\([a-z0-9_]*\)/(\1\&0xff)/g' \
+              -e 's/> *\([a-z0-9_]*\)/(\1>>8)/g' <<< "$*")
     for key in "${!SYMBOLS[@]}"; do
         exp=$(sed -e "s/[[:<:]]$key[[:>:]]/${SYMBOLS[$key]}/g" <<< "$exp");
     done;
