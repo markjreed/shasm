@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 65(C)02 assembler written entirely in bash. Why? Masochism?
-# Note: Does not support Rockwell RMBn/SMBn instructions
+# Note: Does not support Rockwell RMBn/SMBn instructions or binary
+# %-literals.
 
 if (( BASH_VERSINFO[0] < 4 )); then
     echo >&2 "This program requires bash version >= 4."
